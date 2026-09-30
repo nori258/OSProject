@@ -1,0 +1,7 @@
+{
+	"key.categories.osproject": "OSProject",
+	"key.osproject.freecam": "Toggle Freecam",
+	"message.osproject.freecam.enabled": "Freecam enabled",
+	"message.osproject.freecam.disabled": "Freecam disabled",
+	"message.osproject.freecam.damaged": "Freecam disabled: you took damage"
+}

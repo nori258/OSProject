@@ -1,0 +1,28 @@
+{
+	"schemaVersion": 1,
+	"id": "osproject",
+	"version": "${version}",
+	"name": "OSProject",
+	"description": "Client-side utilities. Currently: a free-flying spectator camera (freecam).",
+	"authors": [
+		"nori258"
+	],
+	"contact": {
+		"sources": "https://github.com/nori258/OSProject"
+	},
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"io.github.nori258.osproject.OSProjectClient"
+		]
+	},
+	"mixins": [
+		"osproject.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.15.0",
+		"minecraft": "1.21.1",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

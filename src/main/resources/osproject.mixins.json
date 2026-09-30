@@ -1,0 +1,19 @@
+{
+	"required": true,
+	"minVersion": "0.8",
+	"package": "io.github.nori258.osproject.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"EntityMixin",
+		"GameRendererMixin",
+		"GuiMixin",
+		"LocalPlayerMixin",
+		"MinecraftMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
