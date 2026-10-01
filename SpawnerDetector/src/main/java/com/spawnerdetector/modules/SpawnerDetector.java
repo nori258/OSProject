@@ -3,6 +3,7 @@ package com.spawnerdetector.modules;
 import com.spawnerdetector.SpawnerDetectorAddon;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
+import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.ColorSetting;
@@ -15,18 +16,24 @@ import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
+import net.minecraft.block.Blocks;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.block.entity.BlockEntityType;
 import net.minecraft.client.toast.SystemToast;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.network.packet.s2c.play.BlockEntityUpdateS2CPacket;
+import net.minecraft.network.packet.s2c.play.BlockEventS2CPacket;
+import net.minecraft.network.packet.s2c.play.BlockUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.ChunkDataS2CPacket;
+import net.minecraft.network.packet.s2c.play.ChunkDeltaUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.LightData;
 import net.minecraft.network.packet.s2c.play.LightUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket;
+import net.minecraft.network.packet.s2c.play.WorldEventS2CPacket;
 import net.minecraft.registry.Registries;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
@@ -34,12 +41,15 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.WorldEvents;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -48,11 +58,14 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Finds mob spawners on servers that hide blocks below Y=0 from the client.
  * <ul>
- *     <li>Layer 1 (confirmed): spawner block entities in chunk data and block entity update packets.</li>
- *     <li>Layer 2 (possible): light update packets that leave a whole section below Y=0 without block light.</li>
- *     <li>Layer 3 (possible): spawner mob sounds coming from a spot with no visible mob of that type.</li>
+ *     <li>Packets (confirmed): spawner block entities in chunk data and block entity update packets.</li>
+ *     <li>Activity (confirmed): the block event and spawn particles a spawner broadcasts each time it spawns mobs.
+ *     The server only runs a spawner while a player is within 16 blocks of it.</li>
+ *     <li>Light (possible): single light sources below Y=0 (torches, lanterns, furnaces) in the light data the
+ *     server sends, which give away lit bases even when their blocks are hidden.</li>
+ *     <li>Sound (possible): spawner mob sounds coming from a spot with no visible mob of that type.</li>
  * </ul>
- * Trial spawners and cave spider spawners are never reported, and layers 2 and 3 stay quiet around them.
+ * Trial spawners and cave spider spawners are never reported, and the possible layers stay quiet around them.
  * <p>
  * Packet events arrive on the network thread, so all world access, state changes and chat output
  * are handed to the client thread.
@@ -60,10 +73,16 @@ import java.util.concurrent.ConcurrentHashMap;
 public class SpawnerDetector extends Module {
     private static final Logger LOG = LoggerFactory.getLogger("SpawnerDetector");
 
-    /** A possible spawner this close to a known spawner is treated as that spawner. Covers neighbouring light sections. */
+    /** A possible spawner this close to a known spawner is treated as that spawner. */
     private static final double SAME_SPAWNER_RADIUS = 24;
-    /** Layers 2 and 3 ignore anything this close to a trial spawner or a cave spider spawner. */
+    /** The possible layers ignore anything this close to a trial spawner or a cave spider spawner. */
     private static final double IGNORE_RADIUS = 32;
+    /** Spawned mobs appear within 4 blocks of the spawner; look a little further for the ones that already moved. */
+    private static final double SPAWNED_MOB_RADIUS = 6;
+    /** Ticks to wait after a spawner activity packet so the spawned mobs reach the client before we look at them. */
+    private static final int ACTIVITY_DELAY = 10;
+    /** Torches are 14, lanterns and glowstone 15, furnaces 13. Candles and soul lanterns stay below this. */
+    private static final int MIN_LIGHT_SOURCE_LEVEL = 13;
     private static final int BEAM_HEIGHT = 256;
 
     private static final SystemToast.Type CONFIRMED_TOAST = new SystemToast.Type(6000L);
@@ -72,6 +91,8 @@ public class SpawnerDetector extends Module {
     private record SpawnerSound(String mob, Set<EntityType<?>> sources) {}
 
     private record SpawnerData(BlockPos pos, BlockEntityType<?> type, @Nullable NbtCompound nbt) {}
+
+    private record LightSource(int sectionIndex, int x, int y, int z, int level) {}
 
     // Cave spiders play the spider's sounds (there is no cave spider ambient sound), so spider sounds are opt-in.
     private static final Identifier SPIDER_AMBIENT = SoundEvents.ENTITY_SPIDER_AMBIENT.id();
@@ -86,6 +107,7 @@ public class SpawnerDetector extends Module {
     );
 
     private final Setting<Boolean> packetDetection;
+    private final Setting<Boolean> activityDetection;
     private final Setting<Boolean> lightDetection;
     private final Setting<Boolean> soundDetection;
     private final Setting<Integer> soundRadius;
@@ -93,17 +115,21 @@ public class SpawnerDetector extends Module {
     private final Setting<Boolean> notifications;
     private final Setting<Boolean> debug;
     private final Setting<Boolean> spawnerBeam;
+    private final Setting<Integer> beamWidth;
     private final Setting<SettingColor> beamColor;
     private final Setting<SettingColor> possibleBeamColor;
 
     private final Set<BlockPos> confirmedSpawners = ConcurrentHashMap.newKeySet();
     private final Set<BlockPos> possibleSpawners = ConcurrentHashMap.newKeySet();
     private final Set<BlockPos> ignoredSpawners = ConcurrentHashMap.newKeySet();
+    /** Spawners that just reported activity, with the ticks left before we classify them. */
+    private final Map<BlockPos, Integer> pendingActivity = new HashMap<>();
 
+    private final Color beamSideColor = new Color();
     private ClientWorld trackedWorld;
 
     public SpawnerDetector() {
-        super(SpawnerDetectorAddon.CATEGORY, "spawner-detector", "Detects mob spawners from packets, light updates and mob sounds.");
+        super(SpawnerDetectorAddon.CATEGORY, "spawner-detector", "Detects mob spawners from packets, spawner activity, light and mob sounds.");
 
         // Stay subscribed while joining: the first chunk packets arrive before Meteor's GameJoinedEvent.
         runInMainMenu = true;
@@ -113,14 +139,21 @@ public class SpawnerDetector extends Module {
 
         packetDetection = sgGeneral.add(new BoolSetting.Builder()
             .name("packet-detection")
-            .description("Confirms spawners from chunk data and block entity update packets.")
+            .description("Confirms spawners from chunk data and block entity update packets. Does nothing if the server strips hidden spawners from chunks.")
+            .defaultValue(true)
+            .build()
+        );
+
+        activityDetection = sgGeneral.add(new BoolSetting.Builder()
+            .name("activity-detection")
+            .description("Confirms spawners from the packets they send when they spawn mobs. Works on hidden spawners, but only while a player is within 16 blocks of one and you are within 64.")
             .defaultValue(true)
             .build()
         );
 
         lightDetection = sgGeneral.add(new BoolSetting.Builder()
             .name("light-detection")
-            .description("Flags light updates that leave a whole section below Y=0 without block light as possible spawners.")
+            .description("Flags single light sources below Y=0 (torches, lanterns, furnaces) from the light data the server sends. Finds lit bases, not spawners directly.")
             .defaultValue(true)
             .build()
         );
@@ -159,7 +192,7 @@ public class SpawnerDetector extends Module {
 
         debug = sgGeneral.add(new BoolSetting.Builder()
             .name("debug")
-            .description("Logs every block entity, light update and sound packet to the game log.")
+            .description("Logs every block entity, spawner activity, light and sound packet to the game log.")
             .defaultValue(false)
             .build()
         );
@@ -168,6 +201,16 @@ public class SpawnerDetector extends Module {
             .name("spawner-beam")
             .description("Renders a beam through blocks at every detected spawner.")
             .defaultValue(true)
+            .build()
+        );
+
+        beamWidth = sgRender.add(new IntSetting.Builder()
+            .name("beam-width")
+            .description("Beam width in blocks.")
+            .defaultValue(3)
+            .range(1, 5)
+            .sliderRange(1, 5)
+            .visible(spawnerBeam::get)
             .build()
         );
 
@@ -205,13 +248,11 @@ public class SpawnerDetector extends Module {
 
     @Override
     public void onDeactivate() {
-        confirmedSpawners.clear();
-        possibleSpawners.clear();
-        ignoredSpawners.clear();
+        clearState();
         trackedWorld = null;
     }
 
-    // Layer 1: block entity packets
+    // Block entity packets
 
     @EventHandler
     private void onBlockEntityPacket(PacketEvent.Receive event) {
@@ -249,24 +290,11 @@ public class SpawnerDetector extends Module {
 
         EntityType<?> mob = spawnerMob(spawner.nbt());
         if (mob == EntityType.CAVE_SPIDER) {
-            confirmedSpawners.remove(pos);
             ignoreSpawner(pos);
             return;
         }
 
-        // Active spawners resend their block entity on every spawn cycle, so only announce new ones.
-        if (!packetDetection.get() || !confirmedSpawners.add(pos)) return;
-        possibleSpawners.removeIf(possible -> possible.isWithinDistance(pos, SAME_SPAWNER_RADIUS));
-
-        String mobName = mob != null ? mob.getName().getString() : "Unknown";
-        String coords = pos.toShortString();
-        ChatUtils.infoPrefix("Spawner", "(highlight)%s(default) spawner at (highlight)%s", mobName, coords);
-        LOG.info("Confirmed {} spawner at {}", mobName, coords);
-        if (notifications.get()) showToast(CONFIRMED_TOAST, "Spawner Found", mobName + " @ " + coords);
-    }
-
-    private void ignoreSpawner(BlockPos pos) {
-        if (ignoredSpawners.add(pos)) possibleSpawners.removeIf(possible -> possible.isWithinDistance(pos, IGNORE_RADIUS));
+        if (packetDetection.get()) confirmSpawner(pos, mob != null ? mob.getName().getString() : "Unknown", "");
     }
 
     private static @Nullable EntityType<?> spawnerMob(@Nullable NbtCompound nbt) {
@@ -276,53 +304,165 @@ public class SpawnerDetector extends Module {
         return id.isEmpty() ? null : EntityType.get(id).orElse(null);
     }
 
-    // Layer 2: light updates
+    // Spawner activity: sent to everyone within 64 blocks whenever a spawner spawns mobs, even if its block is hidden
+
+    @EventHandler
+    private void onActivityPacket(PacketEvent.Receive event) {
+        if (!activityDetection.get()) return;
+
+        BlockPos pos;
+        if (event.packet instanceof BlockEventS2CPacket packet && packet.getBlock() == Blocks.SPAWNER) {
+            pos = packet.getPos().toImmutable();
+        } else if (event.packet instanceof WorldEventS2CPacket packet && packet.getEventId() == WorldEvents.SPAWNER_SPAWNS_MOB) {
+            pos = packet.getPos().toImmutable();
+        } else {
+            return;
+        }
+
+        if (debug.get()) LOG.info("[debug] Spawner activity ({}) at {}", event.packet.getClass().getSimpleName(), pos.toShortString());
+        runOnClientThread(() -> {
+            if (!confirmedSpawners.contains(pos) && !ignoredSpawners.contains(pos)) pendingActivity.putIfAbsent(pos, ACTIVITY_DELAY);
+        });
+    }
+
+    @EventHandler
+    private void onTick(TickEvent.Post event) {
+        if (pendingActivity.isEmpty() || !Utils.canUpdate()) return;
+        syncWorld();
+
+        List<BlockPos> ready = new ArrayList<>();
+        pendingActivity.replaceAll((pos, ticks) -> ticks - 1);
+        pendingActivity.forEach((pos, ticks) -> {
+            if (ticks <= 0) ready.add(pos);
+        });
+
+        for (BlockPos pos : ready) {
+            pendingActivity.remove(pos);
+            classifyActiveSpawner(pos);
+        }
+    }
+
+    /** Names an active spawner after the mobs that just appeared around it, if the server lets us see them. */
+    private void classifyActiveSpawner(BlockPos pos) {
+        if (confirmedSpawners.contains(pos) || ignoredSpawners.contains(pos)) return;
+
+        Box around = new Box(pos).expand(SPAWNED_MOB_RADIUS);
+        LivingEntity mob = mc.world.getEntitiesByClass(LivingEntity.class, around, entity -> !(entity instanceof PlayerEntity))
+            .stream()
+            .min(Comparator.comparingDouble(entity -> entity.squaredDistanceTo(Vec3d.ofCenter(pos))))
+            .orElse(null);
+
+        if (mob != null && mob.getType() == EntityType.CAVE_SPIDER) {
+            ignoreSpawner(pos);
+            return;
+        }
+
+        String mobName = mob != null ? mob.getType().getName().getString() : "Active";
+        confirmSpawner(pos, mobName, " (spawning)");
+    }
+
+    // Light: single bright light sources below Y=0
 
     @EventHandler
     private void onLightPacket(PacketEvent.Receive event) {
-        if (!(event.packet instanceof LightUpdateS2CPacket packet) || !lightDetection.get()) return;
+        if (!lightDetection.get()) return;
 
-        int chunkX = packet.getChunkX();
-        int chunkZ = packet.getChunkZ();
-        LightData data = packet.getData();
-        BitSet sent = data.getInitedBlock();
-        BitSet empty = data.getUninitedBlock();
-        List<byte[]> nibbles = data.getBlockNibbles();
-
-        // Sections sent as empty have no block light at all; sent sections can still be all zero.
-        BitSet dark = (BitSet) empty.clone();
-        int nibble = 0;
-        for (int index = sent.nextSetBit(0); index >= 0 && nibble < nibbles.size(); index = sent.nextSetBit(index + 1)) {
-            if (isAllZero(nibbles.get(nibble++))) dark.set(index);
+        int chunkX;
+        int chunkZ;
+        LightData data;
+        if (event.packet instanceof ChunkDataS2CPacket packet) {
+            chunkX = packet.getChunkX();
+            chunkZ = packet.getChunkZ();
+            data = packet.getLightData();
+        } else if (event.packet instanceof LightUpdateS2CPacket packet) {
+            chunkX = packet.getChunkX();
+            chunkZ = packet.getChunkZ();
+            data = packet.getData();
+        } else {
+            return;
         }
 
-        if (debug.get()) LOG.info("[debug] Light update for chunk {}, {}: block light sections sent {}, empty {}, dark {}", chunkX, chunkZ, sent, empty, dark);
-        if (dark.isEmpty()) return;
+        List<LightSource> sources = findLightSources(data);
+        if (debug.get()) LOG.info("[debug] Light for chunk {}, {}: block light sections {}, single light sources {}", chunkX, chunkZ, data.getInitedBlock(), sources.size());
+        if (sources.isEmpty()) return;
 
         runOnClientThread(() -> {
             int bottomY = mc.world.getBottomY();
 
-            for (int index = dark.nextSetBit(0); index >= 0; index = dark.nextSetBit(index + 1)) {
+            for (LightSource source : sources) {
                 // Light data starts one section below the world.
-                int sectionY = (index - 1) * 16 + bottomY;
-                if (sectionY < bottomY || sectionY >= 0) continue;
+                int sectionY = (source.sectionIndex() - 1) * 16 + bottomY;
+                int y = sectionY + source.y();
+                if (sectionY < bottomY || y >= 0) continue;
 
-                if (debug.get()) LOG.info("[debug] Light anomaly at chunk {} {} section {}", chunkX, chunkZ, sectionY >> 4);
-
-                BlockPos candidate = new BlockPos(chunkX * 16 + 8, sectionY + 8, chunkZ * 16 + 8);
-                reportPossible(candidate, "Light anomaly in chunk %d, %d (Y %d to %d)".formatted(chunkX, chunkZ, sectionY, sectionY + 15));
+                BlockPos pos = new BlockPos(chunkX * 16 + source.x(), y, chunkZ * 16 + source.z());
+                reportPossible(pos, "Light source (level %d) below Y=0".formatted(source.level()));
             }
         });
     }
 
-    private static boolean isAllZero(byte[] nibbles) {
-        for (byte b : nibbles) {
-            if (b != 0) return false;
+    /**
+     * Finds blocks whose block light is at least {@link #MIN_LIGHT_SOURCE_LEVEL} and brighter than every neighbour:
+     * a single light source such as a torch or lantern. Lava lakes are skipped because their blocks light each other.
+     */
+    private static List<LightSource> findLightSources(LightData data) {
+        BitSet sent = data.getInitedBlock();
+        List<byte[]> nibbles = data.getBlockNibbles();
+
+        Map<Integer, byte[]> sections = new HashMap<>();
+        int nibble = 0;
+        for (int index = sent.nextSetBit(0); index >= 0 && nibble < nibbles.size(); index = sent.nextSetBit(index + 1)) {
+            sections.put(index, nibbles.get(nibble++));
         }
-        return true;
+
+        List<LightSource> sources = new ArrayList<>();
+        for (Map.Entry<Integer, byte[]> entry : sections.entrySet()) {
+            int index = entry.getKey();
+            byte[] light = entry.getValue();
+            if (maxLevel(light) < MIN_LIGHT_SOURCE_LEVEL) continue;
+
+            byte[] below = sections.get(index - 1);
+            byte[] above = sections.get(index + 1);
+
+            for (int y = 0; y < 16; y++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int x = 0; x < 16; x++) {
+                        int level = level(light, x, y, z);
+                        if (level < MIN_LIGHT_SOURCE_LEVEL) continue;
+
+                        if (x > 0 && level(light, x - 1, y, z) >= level) continue;
+                        if (x < 15 && level(light, x + 1, y, z) >= level) continue;
+                        if (z > 0 && level(light, x, y, z - 1) >= level) continue;
+                        if (z < 15 && level(light, x, y, z + 1) >= level) continue;
+                        if (y > 0 && level(light, x, y - 1, z) >= level) continue;
+                        if (y < 15 && level(light, x, y + 1, z) >= level) continue;
+                        // Sections above and below that were not sent have no block light.
+                        if (y == 0 && below != null && level(below, x, 15, z) >= level) continue;
+                        if (y == 15 && above != null && level(above, x, 0, z) >= level) continue;
+
+                        sources.add(new LightSource(index, x, y, z, level));
+                    }
+                }
+            }
+        }
+
+        return sources;
     }
 
-    // Layer 3: mob sounds
+    private static int level(byte[] light, int x, int y, int z) {
+        int index = y << 8 | z << 4 | x;
+        return light[index >> 1] >> ((index & 1) << 2) & 15;
+    }
+
+    private static int maxLevel(byte[] light) {
+        int max = 0;
+        for (byte b : light) {
+            max = Math.max(max, Math.max(b & 15, b >> 4 & 15));
+        }
+        return max;
+    }
+
+    // Mob sounds
 
     @EventHandler
     private void onSoundPacket(PacketEvent.Receive event) {
@@ -345,7 +485,55 @@ public class SpawnerDetector extends Module {
         });
     }
 
+    // Broken spawners
+
+    @EventHandler
+    private void onBlockUpdatePacket(PacketEvent.Receive event) {
+        List<BlockPos> airPositions = new ArrayList<>();
+
+        if (event.packet instanceof BlockUpdateS2CPacket packet) {
+            if (packet.getState().isAir()) airPositions.add(packet.getPos().toImmutable());
+        } else if (event.packet instanceof ChunkDeltaUpdateS2CPacket packet) {
+            packet.visitUpdates((pos, state) -> {
+                if (state.isAir()) airPositions.add(pos.toImmutable());
+            });
+        } else {
+            return;
+        }
+
+        if (airPositions.isEmpty()) return;
+
+        // Only air counts: hiding a block replaces it with stone or deepslate, breaking it leaves air.
+        runOnClientThread(() -> {
+            for (BlockPos pos : airPositions) {
+                if (confirmedSpawners.remove(pos)) {
+                    ChatUtils.infoPrefix("Spawner", "Spawner at (highlight)%s(default) was broken", pos.toShortString());
+                    LOG.info("Spawner at {} was broken", pos.toShortString());
+                }
+                ignoredSpawners.remove(pos);
+                pendingActivity.remove(pos);
+            }
+        });
+    }
+
     // Shared
+
+    private void confirmSpawner(BlockPos pos, String mobName, String detail) {
+        // Active spawners resend their data on every spawn cycle, so only announce new ones.
+        if (!confirmedSpawners.add(pos)) return;
+        possibleSpawners.removeIf(possible -> possible.isWithinDistance(pos, SAME_SPAWNER_RADIUS));
+
+        String coords = pos.toShortString();
+        ChatUtils.infoPrefix("Spawner", "(highlight)%s(default) spawner at (highlight)%s(default)%s", mobName, coords, detail);
+        LOG.info("Confirmed {} spawner at {}{}", mobName, coords, detail);
+        if (notifications.get()) showToast(CONFIRMED_TOAST, "Spawner Found", mobName + " @ " + coords);
+    }
+
+    private void ignoreSpawner(BlockPos pos) {
+        confirmedSpawners.remove(pos);
+        pendingActivity.remove(pos);
+        if (ignoredSpawners.add(pos)) possibleSpawners.removeIf(possible -> possible.isWithinDistance(pos, IGNORE_RADIUS));
+    }
 
     private void reportPossible(BlockPos pos, String reason) {
         if (isNear(confirmedSpawners, pos, SAME_SPAWNER_RADIUS)) return;
@@ -387,9 +575,14 @@ public class SpawnerDetector extends Module {
         if (mc.world == trackedWorld) return;
 
         trackedWorld = mc.world;
+        clearState();
+    }
+
+    private void clearState() {
         confirmedSpawners.clear();
         possibleSpawners.clear();
         ignoredSpawners.clear();
+        pendingActivity.clear();
     }
 
     // Render
@@ -410,8 +603,12 @@ public class SpawnerDetector extends Module {
     }
 
     private void renderBeam(Render3DEvent event, BlockPos pos, Color color) {
+        double half = beamWidth.get() / 2.0;
         double x = pos.getX() + 0.5;
         double z = pos.getZ() + 0.5;
-        event.renderer.line(x, pos.getY(), z, x, pos.getY() + BEAM_HEIGHT, z, color);
+
+        // Faint sides so a wide beam does not hide everything behind it, solid edges so it stays easy to spot.
+        beamSideColor.set(color).a(color.a / 3);
+        event.renderer.box(x - half, pos.getY(), z - half, x + half, pos.getY() + BEAM_HEIGHT, z + half, beamSideColor, color, ShapeMode.Both, 0);
     }
 }
