@@ -1,0 +1,13 @@
+# Gradle
+.gradle/
+build/
+out/
+
+# Loom dev run directory
+run/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+bin/

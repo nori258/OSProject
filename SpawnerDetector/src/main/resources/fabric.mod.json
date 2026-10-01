@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "spawner-detector",
+  "version": "${version}",
+  "name": "SpawnerDetector",
+  "description": "Meteor Client addon that finds mob spawners from block entity packets, light updates and mob sounds.",
+  "authors": [
+    "nori258"
+  ],
+  "contact": {
+    "sources": "https://github.com/nori258/OSProject"
+  },
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.spawnerdetector.SpawnerDetectorAddon"
+    ]
+  },
+  "custom": {
+    "meteor-client:color": "255,50,50"
+  },
+  "depends": {
+    "java": ">=21",
+    "minecraft": "${mc_version}",
+    "fabricloader": ">=0.16.0",
+    "meteor-client": "*"
+  }
+}
