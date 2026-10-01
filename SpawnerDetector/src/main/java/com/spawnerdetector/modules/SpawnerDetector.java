@@ -74,15 +74,15 @@ public class SpawnerDetector extends Module {
     private record SpawnerData(BlockPos pos, BlockEntityType<?> type, @Nullable NbtCompound nbt) {}
 
     // Cave spiders play the spider's sounds (there is no cave spider ambient sound), so spider sounds are opt-in.
-    private static final Identifier SPIDER_AMBIENT = SoundEvents.ENTITY_SPIDER_AMBIENT.getId();
+    private static final Identifier SPIDER_AMBIENT = SoundEvents.ENTITY_SPIDER_AMBIENT.id();
 
     private static final Map<Identifier, SpawnerSound> SPAWNER_SOUNDS = Map.of(
-        SoundEvents.ENTITY_ZOMBIE_AMBIENT.getId(), new SpawnerSound("Zombie", Set.of(EntityType.ZOMBIE)),
-        SoundEvents.ENTITY_SKELETON_AMBIENT.getId(), new SpawnerSound("Skeleton", Set.of(EntityType.SKELETON)),
+        SoundEvents.ENTITY_ZOMBIE_AMBIENT.id(), new SpawnerSound("Zombie", Set.of(EntityType.ZOMBIE)),
+        SoundEvents.ENTITY_SKELETON_AMBIENT.id(), new SpawnerSound("Skeleton", Set.of(EntityType.SKELETON)),
         SPIDER_AMBIENT, new SpawnerSound("Spider", Set.of(EntityType.SPIDER, EntityType.CAVE_SPIDER)),
-        SoundEvents.ENTITY_BLAZE_AMBIENT.getId(), new SpawnerSound("Blaze", Set.of(EntityType.BLAZE)),
-        SoundEvents.ENTITY_SILVERFISH_AMBIENT.getId(), new SpawnerSound("Silverfish", Set.of(EntityType.SILVERFISH)),
-        SoundEvents.ENTITY_SILVERFISH_STEP.getId(), new SpawnerSound("Silverfish", Set.of(EntityType.SILVERFISH))
+        SoundEvents.ENTITY_BLAZE_AMBIENT.id(), new SpawnerSound("Blaze", Set.of(EntityType.BLAZE)),
+        SoundEvents.ENTITY_SILVERFISH_AMBIENT.id(), new SpawnerSound("Silverfish", Set.of(EntityType.SILVERFISH)),
+        SoundEvents.ENTITY_SILVERFISH_STEP.id(), new SpawnerSound("Silverfish", Set.of(EntityType.SILVERFISH))
     );
 
     private final Setting<Boolean> packetDetection;
@@ -272,7 +272,7 @@ public class SpawnerDetector extends Module {
     private static @Nullable EntityType<?> spawnerMob(@Nullable NbtCompound nbt) {
         if (nbt == null) return null;
 
-        String id = nbt.getCompound("SpawnData").getCompound("entity").getString("id");
+        String id = nbt.getCompoundOrEmpty("SpawnData").getCompoundOrEmpty("entity").getString("id", "");
         return id.isEmpty() ? null : EntityType.get(id).orElse(null);
     }
 
@@ -328,7 +328,7 @@ public class SpawnerDetector extends Module {
     private void onSoundPacket(PacketEvent.Receive event) {
         if (!(event.packet instanceof PlaySoundS2CPacket packet) || !soundDetection.get()) return;
 
-        Identifier id = packet.getSound().value().getId();
+        Identifier id = packet.getSound().value().id();
         Vec3d soundPos = new Vec3d(packet.getX(), packet.getY(), packet.getZ());
         if (debug.get()) LOG.info("[debug] Sound {} at {}", id, soundPos);
 
@@ -336,7 +336,7 @@ public class SpawnerDetector extends Module {
         if (sound == null || (id.equals(SPIDER_AMBIENT) && !spiderSounds.get())) return;
 
         runOnClientThread(() -> {
-            if (mc.player.getPos().distanceTo(soundPos) > soundRadius.get()) return;
+            if (mc.player.getEntityPos().distanceTo(soundPos) > soundRadius.get()) return;
 
             Box searchBox = Box.of(soundPos, 16, 16, 16);
             if (!mc.world.getEntitiesByClass(LivingEntity.class, searchBox, entity -> sound.sources().contains(entity.getType())).isEmpty()) return;
